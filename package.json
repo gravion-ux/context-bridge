@@ -83,7 +83,7 @@
   },
   "scripts": {
     "test": "node --test",
-    "check": "node --check src/core.js && node --check src/extension.js && node --check test/core.test.js",
+    "check": "node --check src/core.js && node --check src/workspace.js && node --check src/extension.js && node --check test/core.test.js && node --check test/security-regressions.test.js && node --check test/workspace.test.js && node --check test/extension.test.js",
     "package": "npx @vscode/vsce package"
   },
   "repository": {

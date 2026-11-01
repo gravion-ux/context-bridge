@@ -28,6 +28,9 @@ before sharing it.
   handoff will fit in a fresh context window.
 - **Persistent project notes** — durable decisions, constraints and known issues, stored locally
   and included in future handoffs.
+- **Injection-resistant rendering** — free-text answers are escaped so that a pasted file or a
+  commit message cannot forge a section of the handoff, and quoted content is fenced with a
+  length chosen to match the content.
 - **Local-first** — no telemetry, no model-provider calls, no automatic upload.
 
 ## Requirements
@@ -88,9 +91,13 @@ code --install-extension gravion-context-bridge-0.1.0.vsix
 <workspace>/
 └── .gravion/
     ├── handoffs/
-    │   └── handoff-20261028-094512.md
+    │   └── handoff-20261028-094512-742.md
     └── project-notes.md
 ```
+
+The filename carries the date, the time and the millisecond, so two handoffs created in quick
+succession never collide. A handoff is created exclusively — an existing file is never
+overwritten.
 
 `.gravion/` is excluded by `.gitignore`. Handoffs and notes frequently contain private
 information, so they never end up in a commit by accident.
@@ -99,12 +106,18 @@ information, so they never end up in a commit by accident.
 
 These directories are never listed:
 
-`node_modules`, `.git`, `dist`, `build`, `coverage`, `.next`
+`node_modules`, `.git`, `dist`, `build`, `coverage`, `.next`, `.gravion`
+
+The match is case-insensitive, so `NODE_MODULES` is skipped on a case-insensitive filesystem too.
 
 These filenames are never listed, and their contents are never read:
 
 `.env`, `.env.*`, `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`, `*.pem`, `*.key`, `*.p12`, `*.pfx`,
-`*.keystore`
+`*.keystore`, `*.jks`, `.npmrc`, `.netrc`, `.pypirc`, `.htpasswd`, `.git-credentials`,
+`.dockercfg`, `credentials`, `credentials.*`, `secrets`, `secrets.*`, `service-account.*`
+
+Symbolic links are never listed and never followed. A directory that cannot be read is counted
+and reported in the handoff rather than silently omitted.
 
 ## Security and privacy
 
@@ -113,30 +126,42 @@ These filenames are never listed, and their contents are never read:
 - No AI provider is contacted. The extension never sends your code anywhere.
 - Editor contents are only included after you explicitly choose to include them.
 - Git commands are read-only (`status`, `log`).
+- A handoff is a document the next agent will act on, so the renderer treats every free-text
+  answer as untrusted: structural Markdown markers are escaped and quoted content is fenced with
+  a fence long enough to survive the content it wraps.
 - Secret redaction is **best-effort pattern matching, not a complete secret scanner.**
   Always read a handoff before sharing it.
 
-See [SECURITY.md](SECURITY.md) for the full data-handling notes and known limitations.
+See [SECURITY.md](SECURITY.md) for the full data-handling notes and known limitations, and
+[docs/SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md) for the audit that produced the current
+rendering and redaction behaviour.
 
 ## Development
 
 ```bash
-npm test        # runs the Node.js built-in test runner
-npm run check   # syntax-checks every JavaScript file
+npm test        # runs the Node.js built-in test runner (66 tests)
+npm run check   # syntax-checks every JavaScript file in the repository
 npm run package # builds a VSIX with @vscode/vsce
 ```
 
 The core logic lives in `src/core.js` and has no VS Code dependency, so it is directly testable.
-The VS Code integration lives in `src/extension.js`.
+The filesystem and Git layer lives in `src/workspace.js`, which is also free of any VS Code
+dependency. `src/extension.js` is the thin VS Code glue on top of the two.
 
 ## Project layout
 
 ```text
 .
 ├── .github/workflows/ci.yml   # CI: npm test + npm run check on Node 18/20/22
-├── src/core.js                # handoff rendering, redaction, token estimate (pure)
-├── src/extension.js           # VS Code commands, workspace/Git/editor collection
-├── test/core.test.js          # node:test suite for the core module
+├── docs/
+│   └── SECURITY_AUDIT.md      # security and reliability audit, with test evidence
+├── src/core.js                # handoff rendering, escaping, redaction, token estimate (pure)
+├── src/workspace.js           # workspace listing, handoff files, project notes, Git (pure)
+├── src/extension.js           # VS Code commands and editor collection
+├── test/core.test.js          # original suite for the core module (unchanged)
+├── test/security-regressions.test.js # regression tests for the audited defects
+├── test/workspace.test.js     # suite for the filesystem and Git layer
+├── test/extension.test.js     # suite for the VS Code glue, with a stubbed vscode module
 ├── CHANGELOG.md
 ├── CONTRIBUTING.md
 ├── LICENSE

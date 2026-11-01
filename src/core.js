@@ -10,6 +10,10 @@ const DEFAULTS = Object.freeze({
 /**
  * Directories that are never listed in a handoff. They are generated,
  * vendored or otherwise noisy and add no useful context.
+ *
+ * Matching is case-insensitive: on Windows and macOS the filesystem is
+ * case-insensitive too, so `NODE_MODULES` is the same directory as
+ * `node_modules` and must be skipped as well.
  */
 const SKIP_DIRECTORIES = Object.freeze([
   'node_modules',
@@ -18,6 +22,7 @@ const SKIP_DIRECTORIES = Object.freeze([
   'build',
   'coverage',
   '.next',
+  '.gravion',
 ]);
 
 function asText(value) {
@@ -30,10 +35,73 @@ function cleanSection(value, fallback = '_Not provided._') {
 }
 
 /**
+ * Collapses a value to a single line so it cannot introduce a new Markdown
+ * block when it is interpolated into an existing line. Every whitespace run
+ * becomes one space, so a blank line cannot leave a double gap behind.
+ */
+function escapeInlineText(value) {
+  return asText(value).replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Neutralises Markdown structures that could forge a section of the handoff.
+ *
+ * Free-text answers are read by the next agent, so a file, a commit message
+ * or a pasted note that contains a line such as `## Decisions already made`
+ * must not be able to pose as a section of the handoff itself. Line breaks
+ * are preserved so the answer stays readable; only the structural markers
+ * are escaped.
+ */
+function escapeMarkdownText(value) {
+  return asText(value)
+    .split('\n')
+    .map((line) => {
+      if (/^\s{0,3}#{1,6}(\s|$)/.test(line)) {
+        return `\\${line}`;
+      }
+      if (/^\s{0,3}>/.test(line)) {
+        return `\\${line}`;
+      }
+      if (/^\s{0,3}<[A-Za-z!/?]/.test(line)) {
+        return `\\${line}`;
+      }
+      if (/^\s{0,3}([-*_=]\s*){3,}$/.test(line)) {
+        return `\\${line}`;
+      }
+      if (/^\s{0,3}(?:`{3,}|~{3,})/.test(line)) {
+        return `\\${line}`;
+      }
+      return line;
+    })
+    .join('\n');
+}
+
+/**
+ * Returns a code fence that is guaranteed to be longer than any backtick run
+ * inside `content`, as required by CommonMark. Without this, content that
+ * contains a fence closes the block early and the remainder is rendered as
+ * document structure.
+ */
+function fenceFor(content) {
+  const text = asText(content);
+  const runs = text.match(/`+/g);
+  let longest = 0;
+  if (runs) {
+    for (const run of runs) {
+      if (run.length > longest) {
+        longest = run.length;
+      }
+    }
+  }
+  return '`'.repeat(Math.max(3, longest + 1));
+}
+
+/**
  * True when a directory should be excluded from the workspace listing.
  */
 function shouldSkipDirectory(name) {
-  return SKIP_DIRECTORIES.includes(asText(name).trim());
+  const normalized = asText(name).trim().toLowerCase();
+  return SKIP_DIRECTORIES.includes(normalized);
 }
 
 /**
@@ -45,13 +113,24 @@ function isSecretFileName(name) {
   if (!fileName) {
     return false;
   }
-  if (fileName === '.env' || fileName.startsWith('.env.')) {
+  const lower = fileName.toLowerCase();
+
+  if (lower === '.env' || lower.startsWith('.env.')) {
     return true;
   }
-  if (/^(?:id_rsa|id_dsa|id_ecdsa|id_ed25519)$/i.test(fileName)) {
+  if (/^(?:id_rsa|id_dsa|id_ecdsa|id_ed25519)$/.test(lower)) {
     return true;
   }
-  return /\.(?:pem|key|p12|pfx|keystore)$/i.test(fileName);
+  if (/\.(?:pem|key|p12|pfx|keystore|jks)$/.test(lower)) {
+    return true;
+  }
+  if (/^\.?(?:npmrc|netrc|pypirc|htpasswd|git-credentials|dockercfg)$/.test(lower)) {
+    return true;
+  }
+  if (/^(?:credentials|secrets?|service[-_]?account)(?:\.(?:json|ya?ml|toml|ini|conf|env|txt))?$/i.test(fileName)) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -67,7 +146,14 @@ function truncateText(value, maxChars) {
   if (text.length <= limit) {
     return { text, truncated: false };
   }
-  return { text: text.slice(0, limit), truncated: true };
+
+  let slice = text.slice(0, limit);
+  const last = slice.charCodeAt(slice.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) {
+    // Never split a surrogate pair: a lone surrogate is written as U+FFFD.
+    slice = slice.slice(0, -1);
+  }
+  return { text: slice, truncated: true };
 }
 
 /**
@@ -88,6 +174,27 @@ function redactSecrets(value) {
   text = text.replace(/\bAKIA[0-9A-Z]{16}\b/g, '[REDACTED AWS ACCESS KEY]');
   text = text.replace(/\b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{16,}\b/g, '[REDACTED API KEY]');
   text = text.replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b/g, '[REDACTED API KEY]');
+  // Google API keys are `AIza` + 35 characters. The tail length is treated as
+  // a lower bound so a key that was truncated in a log or a transcript is
+  // still redacted instead of leaking its remaining characters.
+  text = text.replace(/\bAIza[0-9A-Za-z_-]{30,}/g, '[REDACTED GOOGLE API KEY]');
+  text = text.replace(/\b(?:xox[baprs]-)[0-9A-Za-z-]{10,}\b/g, '[REDACTED SLACK TOKEN]');
+  text = text.replace(/\bglpat-[0-9A-Za-z_-]{20,}\b/g, '[REDACTED GITLAB TOKEN]');
+  text = text.replace(
+    /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g,
+    '[REDACTED JWT]'
+  );
+
+  // An Authorization field carries a scheme *and* a credential. Redacting the
+  // scheme alone would leave `Basic <base64>` in clear text, so the whole
+  // value of the field is replaced.
+  text = text.replace(
+    /(\b(?:proxy-)?authorization["']?\s*[:=]\s*)("[^"\n]*"|'[^'\n]*'|[^\r\n]*)/gi,
+    (match, prefix, rawValue) => {
+      const quote = rawValue.startsWith('"') ? '"' : rawValue.startsWith("'") ? "'" : '';
+      return `${prefix}${quote}[REDACTED]${quote}`;
+    }
+  );
 
   // Named assignments such as API_KEY=..., "api_key": "..." or token: ...
   // The name may start with the keyword itself, so the keyword is allowed to
@@ -136,28 +243,59 @@ function formatEditorExcerpts(excerpts) {
   return excerpts.map((excerpt) => {
     const language = asText(excerpt.languageId).trim() || 'text';
     const body = cleanSection(excerpt.content, '_Empty editor._');
+    const fence = fenceFor(body);
     const truncated = excerpt.truncated ? '\n\n_Excerpt truncated._' : '';
-    return `### ${asText(excerpt.path)}\n\n\`\`\`${language}\n${body}\n\`\`\`${truncated}`;
+    const heading = escapeInlineText(excerpt.path) || 'unknown';
+    return `### ${heading}\n\n${fence}${language}\n${body}\n${fence}${truncated}`;
   }).join('\n\n');
 }
 
 function generateHandoff(input = {}) {
   const redact = input.redactSecrets !== false;
   const maybeRedact = (value) => redact ? redactSecrets(value) : asText(value);
-  const title = cleanSection(maybeRedact(input.title), 'Untitled session handoff');
-  const workspaceName = cleanSection(maybeRedact(input.workspaceName), '_No workspace folder open._');
-  const generatedAt = input.generatedAt || new Date().toISOString();
-  const workspaceListing = formatWorkspaceListing(input.workspaceEntries, {
+  const section = (value, fallback) => cleanSection(escapeMarkdownText(maybeRedact(value)), fallback);
+
+  const title = escapeInlineText(maybeRedact(input.title)) || 'Untitled session handoff';
+  const workspaceName = escapeInlineText(maybeRedact(input.workspaceName)) || '_No workspace folder open._';
+  const generatedAt = escapeInlineText(input.generatedAt || new Date().toISOString());
+
+  const workspaceEntries = Array.isArray(input.workspaceEntries)
+    ? input.workspaceEntries.map((entry) => {
+      if (typeof entry === 'string') {
+        return maybeRedact(entry);
+      }
+      if (!entry || typeof entry !== 'object') {
+        return entry;
+      }
+      return { ...entry, path: maybeRedact(entry.path) };
+    })
+    : [];
+  const workspaceListing = formatWorkspaceListing(workspaceEntries, {
     maxEntries: input.workspaceListingMaxEntries,
   });
-  const gitStatus = cleanSection(maybeRedact(input.gitStatus), '_Git context was not collected._');
-  const gitLog = cleanSection(maybeRedact(input.gitLog), '_Git context was not collected._');
-  const projectNotes = cleanSection(maybeRedact(input.projectNotes), '_No project notes recorded._');
-  const excerpts = (input.editorExcerpts || []).map((excerpt) => ({
-    ...excerpt,
-    path: maybeRedact(excerpt.path),
-    content: maybeRedact(excerpt.content),
-  }));
+
+  const skipped = Array.isArray(input.workspaceListingSkipped) ? input.workspaceListingSkipped : [];
+  const listingNote = skipped.length
+    ? `_${skipped.length} path(s) could not be listed (${escapeInlineText(
+      skipped.map((item) => item && item.path).filter(Boolean).join(', ')
+    )})._`
+    : '';
+
+  const gitStatus = cleanSection(escapeMarkdownText(maybeRedact(input.gitStatus)), '_Git context was not collected._');
+  const gitLog = cleanSection(escapeMarkdownText(maybeRedact(input.gitLog)), '_Git context was not collected._');
+  const projectNotes = section(input.projectNotes, '_No project notes recorded._');
+
+  const rawExcerpts = Array.isArray(input.editorExcerpts) ? input.editorExcerpts : [];
+  const excerpts = rawExcerpts
+    .filter((excerpt) => excerpt && typeof excerpt === 'object')
+    .map((excerpt) => ({
+      ...excerpt,
+      path: maybeRedact(excerpt.path),
+      content: maybeRedact(excerpt.content),
+    }));
+
+  const gitStatusFence = fenceFor(gitStatus);
+  const gitLogFence = fenceFor(gitLog);
 
   const body = `# Session Handoff: ${title}
 
@@ -170,23 +308,23 @@ function generateHandoff(input = {}) {
 
 ## Goal
 
-${cleanSection(maybeRedact(input.goal))}
+${section(input.goal)}
 
 ## Current state
 
-${cleanSection(maybeRedact(input.currentState))}
+${section(input.currentState)}
 
 ## Decisions already made
 
-${cleanSection(maybeRedact(input.decisions))}
+${section(input.decisions)}
 
 ## Next steps
 
-${cleanSection(maybeRedact(input.nextSteps))}
+${section(input.nextSteps)}
 
 ## Open questions or blockers
 
-${cleanSection(maybeRedact(input.blockers))}
+${section(input.blockers)}
 
 ## Project notes
 
@@ -194,19 +332,19 @@ ${projectNotes}
 
 ## Workspace listing
 
-${workspaceListing}
+${workspaceListing}${listingNote ? `\n\n${listingNote}` : ''}
 
 ## Git status (read-only)
 
-\`\`\`text
+${gitStatusFence}text
 ${gitStatus}
-\`\`\`
+${gitStatusFence}
 
 ## Recent commits (read-only)
 
-\`\`\`text
+${gitLogFence}text
 ${gitLog}
-\`\`\`
+${gitLogFence}
 
 ## Optional visible-editor excerpts
 
@@ -230,6 +368,9 @@ module.exports = {
   DEFAULTS,
   SKIP_DIRECTORIES,
   estimateTokens,
+  escapeInlineText,
+  escapeMarkdownText,
+  fenceFor,
   formatEditorExcerpts,
   formatWorkspaceListing,
   generateHandoff,
