@@ -162,9 +162,15 @@ async function realpathOrUndefined(target) {
  * handoff. When a path cannot be resolved the lexical result is kept, so a
  * file that has not been written yet is still accepted.
  */
+function isOutsideRelative(relative) {
+  // A plain startsWith('..') would also reject an in-workspace file whose
+  // name merely begins with two dots (for example "..notes.md").
+  return relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
+}
+
 async function isInsideWorkspace(root, filePath) {
   const lexical = path.relative(root, filePath);
-  if (lexical === '' || lexical.startsWith('..') || path.isAbsolute(lexical)) {
+  if (lexical === '' || isOutsideRelative(lexical)) {
     return false;
   }
 
@@ -178,7 +184,7 @@ async function isInsideWorkspace(root, filePath) {
   }
 
   const relative = path.relative(realRoot, realFile);
-  return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
+  return relative !== '' && !isOutsideRelative(relative);
 }
 
 /**

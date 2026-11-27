@@ -344,3 +344,14 @@ test('collectGitContext reads status and log inside a repository', async (t) => 
 
   assert.match(context.gitLog, /initial/);
 });
+
+test('isInsideWorkspace accepts a file whose name starts with two dots', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gcb-'));
+  try {
+    const dotted = path.join(root, '..notes.md');
+    await fs.writeFile(dotted, 'notes', 'utf8');
+    assert.equal(await isInsideWorkspace(root, dotted), true);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
